@@ -1077,7 +1077,18 @@ const hasCommonJsModuleSource = (
   >();
   const examined = new WeakSet<object>();
   let additionalStates = 0;
-  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+  // A strict check that exhausts the budget examines the queued sources by
+  // their own selected keys, breadth first, so a growing alias cannot starve a
+  // sibling. One may still be a retained module identity, possibly behind a
+  // binding, call, container or getter, so a second budget bounds every state
+  // created after exhaustion. Unnormalized paths can grow without a binding.
+  let exhausted = false;
+  let drained = 0;
+  for (
+    let next = pending.pop();
+    next !== undefined;
+    next = exhausted ? pending.shift() : pending.pop()
+  ) {
     const value = unwrapJavaScriptExpression(next.node).node;
     const { awaitDepths } = next;
     const byMode =
@@ -1090,19 +1101,27 @@ const hasCommonJsModuleSource = (
       byMode.set(modeKey, context);
       contexts.set(value, byMode);
     }
-    const path = selections.normalize(context, next.path);
-    if (selections.limited) return true;
+    let path = exhausted ? next.path : selections.normalize(context, next.path);
+    if (selections.limited && !exhausted) {
+      if (includeUnknown) return true;
+      exhausted = true;
+      // The limiter widens every key after exhaustion. Keep the selected keys.
+      path = next.path;
+    }
     const pathKey = JSON.stringify(path);
     let identity = context.identities.get(pathKey);
     if (identity === undefined) {
       // Consumption contexts must not provide an unbounded second path to
       // expansion beyond the shared selector budget.
-      if (
+      if (exhausted) {
+        if (++drained > SEMANTIC_ALIAS_SELECTION_LIMIT) break;
+      } else if (
         (byMode.size > 1 || context.identities.size > 0) &&
         ++additionalStates > SEMANTIC_ALIAS_SELECTION_LIMIT
       ) {
         state.valueResourceLimits.add("alias-selections");
-        return true;
+        if (includeUnknown) return true;
+        exhausted = true;
       }
       identity = {};
       context.identities.set(pathKey, identity);
