@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { desktopTaskSchema } from "../../domain/desktop/appTask.js";
+import { END_CHECKPOINT } from "../../domain/desktop/buildCapture.js";
 import { jsonValueSchema, type JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { AGENTENV_PROVIDER } from "../../desktop/AgentEnvComputerHelper.js";
@@ -17,6 +18,7 @@ import {
   errorText,
   readOutput,
   refused,
+  reportedFailure,
   runRea,
 } from "./DesktopBuildCommands.js";
 import {
@@ -25,21 +27,26 @@ import {
 } from "./DesktopOutputTree.js";
 
 const EXPORT = "export_build_environment";
-/** The most bytes the task takes in the controller's one JSON argument, which Linux caps at 128 KiB. */
-const TASK_ARGUMENT_BYTES = 96 * 1024;
-
 const exportResultSchema = z.looseObject({
   environment: z.string(),
+  tasks: z.array(jsonValueSchema),
   seed_files: z.array(z.string()),
   scrubbed_files: z.array(z.string()),
+  // An export from before gzip seeds were listed apart has none.
+  recompressed_files: z.array(z.string()).default([]),
   unscrubbed_files: z.array(z.string()),
   limitations: z.array(z.string()),
-  task: jsonValueSchema,
 });
 
-/** What the agent asks the export for: its task, the folder here and, optionally, the environment's name. */
-export interface BuildExportRequest {
+/** One task the export takes, with the checkpoint its end state is read at. */
+interface BuildExportTask {
   readonly task: z.output<typeof desktopTaskSchema>;
+  readonly end_checkpoint?: string | undefined;
+}
+
+/** What the agent asks the export for: its tasks, the folder here and, optionally, the environment's name. */
+export interface BuildExportRequest {
+  readonly tasks: readonly BuildExportTask[];
   readonly directory: string;
   readonly name?: string | undefined;
 }
@@ -50,9 +57,10 @@ export type ExportedBuild = {
   readonly environment: string;
   readonly files: number;
   readonly bytes: number;
-  readonly task: JsonValue;
+  readonly tasks: JsonValue[];
   readonly seed_files: string[];
   readonly scrubbed_files: string[];
+  readonly recompressed_files: string[];
   readonly unscrubbed_files: string[];
   readonly limitations: string[];
 };
@@ -117,6 +125,8 @@ export const exportBuild = async (
     readonly attempt: number;
     /** The URL a computer downloads the app's `.deb` from, when the capture says apt does not install it. */
     readonly packageUrl?: string;
+    /** The packages the request named beside the app, which the bundle installs beside it too. */
+    readonly extraPackages: readonly string[];
   },
   request: BuildExportRequest,
   signal: AbortSignal,
@@ -124,37 +134,38 @@ export const exportBuild = async (
   const { folder } = capture;
   const attempt = String(capture.attempt);
   const bundle = `${folder}/bundle-${attempt}`;
-  const task = `${folder}/task-${attempt}.json`;
   const stdout = `${folder}/export-${attempt}.json`;
-  const taskFile = `${JSON.stringify(request.task, null, 2)}\n`;
-  const taskBytes = Buffer.byteLength(JSON.stringify(taskFile));
-  if (taskBytes > TASK_ARGUMENT_BYTES)
-    return err(
-      refused(
-        EXPORT,
-        `The task takes ${String(taskBytes)} bytes in the command REA runs in the computer, more than the ${String(TASK_ARGUMENT_BYTES)} it allows a task.`,
-        "Shorten the task's prompt or checks and export again.",
-      ),
-    );
+  const taskFiles = Object.fromEntries(
+    request.tasks.map(({ task }, index) => [
+      `${folder}/task-${attempt}-${String(index + 1)}.json`,
+      `${JSON.stringify(task, null, 2)}\n`,
+    ]),
+  );
   try {
-    const bytes = await runRea(
+    const { stdoutBytes: bytes } = await runRea(
       computer,
       [
         "export-desktop-application",
         `${folder}/capture`,
         bundle,
-        "--task",
-        task,
+        ...Object.keys(taskFiles).flatMap((path) => ["--task", path]),
+        ...request.tasks.flatMap(({ task, end_checkpoint: end }) => [
+          "--task-end",
+          `${task.name}=${end ?? END_CHECKPOINT}`,
+        ]),
         ...ENDS,
+        // The building agent made the seed in this computer for the task.
+        "--synthetic-seed",
         ...(request.name === undefined ? [] : ["--name", request.name]),
         ...(capture.packageUrl === undefined
           ? []
           : ["--package-url", capture.packageUrl]),
+        ...capture.extraPackages.flatMap((name) => ["--extra-package", name]),
         "--json",
       ],
       {
         stdout,
-        files: { [task]: taskFile },
+        files: taskFiles,
         signal,
       },
     );
@@ -168,7 +179,7 @@ export const exportBuild = async (
               output.failure.remediation?.action ??
                 "Rewrite the task and export again.",
             )
-          : adapterError(EXPORT, output.failure.message),
+          : reportedFailure(EXPORT, output),
       );
     const result = exportResultSchema.parse(output.result);
     const written = await writeBundle(
@@ -183,9 +194,10 @@ export const exportBuild = async (
       environment: result.environment,
       files: written.value.files,
       bytes: written.value.bytes,
-      task: result.task,
+      tasks: result.tasks,
       seed_files: result.seed_files,
       scrubbed_files: result.scrubbed_files,
+      recompressed_files: result.recompressed_files,
       unscrubbed_files: result.unscrubbed_files,
       limitations: result.limitations,
     });
