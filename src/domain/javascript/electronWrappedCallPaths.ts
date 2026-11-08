@@ -1,5 +1,8 @@
 import * as t from "@babel/types";
-import { runtimeFunctionParameters } from "./javascriptAstValues.js";
+import {
+  runtimeFunctionParameters,
+  unwrapJavaScriptExpression,
+} from "./javascriptAstValues.js";
 import { JavaScriptSymbolicBindings } from "./javascriptSymbolicBindings.js";
 import {
   symbolicVariants,
@@ -32,7 +35,10 @@ import {
 } from "./javascriptContextBridgeExposure.js";
 import {
   boundedExpression,
+  contextBridgeMemberByteLimit,
   contextBridgeMemberPathDepth,
+  contextBridgeMemberVisitLimit,
+  createContextBridgeMemberBudget,
 } from "./electronStaticAnalysisValues.js";
 import {
   argumentNode,
@@ -727,9 +733,27 @@ export function* collectElectronWrappedCallPathsSteps(
   const hasConditions = (value: SymbolicValue): boolean =>
     symbolicVariants(value).some((variant) => variant.conditions?.length);
   const bridgeSites = new Map<string, BridgeSite>();
+  const hasCompleteBridgeApi = (value: ElectronContextBridgeFinding): boolean =>
+    (value.api_status === "object-literal" ||
+      value.api_status === "function") &&
+    value.unknown_members === 0;
   // Sites whose direct syntax already observed every fact substitution could
-  // recover: a literal key and an object literal without unknown members.
+  // recover: a literal key, known world identity, and complete API shape.
   let completeBridgeSyntax: Set<string> | undefined;
+  let directBridgeBySite:
+    | ReadonlyMap<string, ElectronContextBridgeFinding>
+    | undefined;
+  const directBridgeAt = (
+    siteKey: string,
+  ): ElectronContextBridgeFinding | undefined => {
+    directBridgeBySite ??= new Map(
+      accumulator.contextBridgeApis.map(({ value }) => [
+        javascriptSourceRangeKey(value.location),
+        value,
+      ]),
+    );
+    return directBridgeBySite.get(siteKey);
+  };
   const bridgeSiteAt = (
     node: t.CallExpression | t.OptionalCallExpression,
     siteKey: string,
@@ -738,8 +762,8 @@ export function* collectElectronWrappedCallPathsSteps(
     completeBridgeSyntax ??= new Set(
       accumulator.contextBridgeApis.flatMap(({ value }) =>
         value.api_key !== null &&
-        value.api_status === "object-literal" &&
-        value.unknown_members === 0
+        (value.world_id === null || value.world_id.status !== "dynamic") &&
+        hasCompleteBridgeApi(value)
           ? [javascriptSourceRangeKey(value.location)]
           : [],
       ),
@@ -757,6 +781,10 @@ export function* collectElectronWrappedCallPathsSteps(
     }
     return site;
   };
+  const bridgeInventoryBudget = createContextBridgeMemberBudget();
+  const functionlessBridgeObjects = new WeakSet<SymbolicValue>();
+  let remainingBridgeFunctionVisits = contextBridgeMemberVisitLimit * 4;
+  let remainingBridgeFunctionBytes = contextBridgeMemberByteLimit * 4;
   /**
    * Dotted member paths of one exposed API value, bounded like the direct
    * syntax inventory. A nested value is enumerated when it resolves to an
@@ -767,19 +795,47 @@ export function* collectElectronWrappedCallPathsSteps(
   ): { readonly members: readonly string[]; readonly unknown: number } => {
     const members = new Set<string>();
     let unknown = 0;
-    const visit = (value: SymbolicValue, prefix: readonly string[]): void => {
-      if (prefix.length >= contextBridgeMemberPathDepth) {
+    const visit = (
+      value: SymbolicValue,
+      prefixPath: string,
+      prefixDepth: number,
+      prefixBytes: number,
+    ): void => {
+      if (prefixDepth >= contextBridgeMemberPathDepth) {
         unknown += 1;
         return;
       }
-      unknown += resolver.unknownMembers(value);
-      for (const member of resolver.members(value)) {
-        if (--remainingVisits < 0) {
-          unknown += 1;
+      if (prefixDepth === 0) {
+        for (const variant of symbolicVariants(value)) {
+          if (variant.kind !== "function")
+            unknown += resolver.unknownMembers(variant);
+        }
+      } else {
+        unknown += resolver.unknownMembers(value);
+      }
+      const keys = resolver.members(value);
+      for (let index = 0; index < keys.length; index += 1) {
+        if (
+          --remainingVisits < 0 ||
+          bridgeInventoryBudget.remainingVisits <= 0
+        ) {
+          unknown += keys.length - index;
           return;
         }
-        const path = [...prefix, member];
-        members.add(path.join("."));
+        bridgeInventoryBudget.remainingVisits -= 1;
+        const member = keys[index];
+        if (member === undefined) break;
+        const memberBytes = Buffer.byteLength(member, "utf8");
+        const pathBytes =
+          prefixDepth === 0 ? memberBytes : prefixBytes + 1 + memberBytes;
+        if (pathBytes > bridgeInventoryBudget.remainingBytes) {
+          bridgeInventoryBudget.remainingVisits = 0;
+          unknown += keys.length - index;
+          return;
+        }
+        bridgeInventoryBudget.remainingBytes -= pathBytes;
+        const path = prefixDepth === 0 ? member : `${prefixPath}.${member}`;
+        members.add(path);
         for (const variant of symbolicVariants(
           resolver.property(value, member),
         ))
@@ -789,11 +845,11 @@ export function* collectElectronWrappedCallPathsSteps(
               variant.kind === "namespace") &&
             !variant.conditions?.length
           )
-            visit(variant, path);
+            visit(variant, path, prefixDepth + 1, pathBytes);
         if (remainingVisits < 0) return;
       }
     };
-    visit(object, []);
+    visit(object, "", 0, 0);
     return {
       members: [...members].sort(compareUnicodeCodePoints),
       unknown,
@@ -802,48 +858,94 @@ export function* collectElectronWrappedCallPathsSteps(
   function* bridgeMemberFunctions(
     value: SymbolicValue,
     segments: readonly string[] = [],
+    prefixBytes = 0,
     active = new Set<SymbolicValue>(),
-  ): Generator<{
-    readonly name: string;
-    readonly path: readonly string[];
-    readonly fn: SymbolicFunction;
-  }> {
-    if (active.has(value)) return;
+  ): Generator<
+    {
+      readonly name: string;
+      readonly path: readonly string[];
+      readonly fn: SymbolicFunction;
+    },
+    boolean
+  > {
+    if (active.has(value) || functionlessBridgeObjects.has(value)) return false;
     if (active.size >= 128) {
       accumulator.unknownFindings += 1;
       accumulator.electronCallPathLimitReached = true;
-      return;
+      return true;
     }
     const nested = new Set(active);
     nested.add(value);
+    let foundFunction = false;
+    let truncated = false;
     for (const member of [...resolver.members(value)].sort()) {
-      if (--remainingVisits < 0) return;
-      const path = [...segments, member];
-      const name = path.join(".");
-      for (const variant of symbolicVariants(
-        resolver.property(value, member),
-      )) {
-        if (variant.kind === "function") yield { name, path, fn: variant };
-        else if (resolver.members(variant).length > 0)
-          yield* bridgeMemberFunctions(variant, path, nested);
+      if (--remainingVisits < 0) {
+        truncated = true;
+        break;
       }
-      if (remainingVisits < 0) return;
+      if (remainingBridgeFunctionVisits <= 0) {
+        accumulator.unknownFindings += 1;
+        accumulator.electronCallPathLimitReached = true;
+        truncated = true;
+        break;
+      }
+      remainingBridgeFunctionVisits -= 1;
+      const memberBytes = Buffer.byteLength(member, "utf8");
+      const nextBytes =
+        segments.length === 0 ? memberBytes : prefixBytes + 1 + memberBytes;
+      if (nextBytes > remainingBridgeFunctionBytes) {
+        remainingBridgeFunctionVisits = 0;
+        accumulator.unknownFindings += 1;
+        accumulator.electronCallPathLimitReached = true;
+        truncated = true;
+        break;
+      }
+      const variants = symbolicVariants(resolver.property(value, member));
+      const hasRelevantVariant = variants.some(
+        (variant) =>
+          variant.kind === "function" || resolver.members(variant).length > 0,
+      );
+      if (!hasRelevantVariant) continue;
+      const path = [...segments, member];
+      for (const variant of variants) {
+        if (variant.kind === "function") {
+          remainingBridgeFunctionBytes -= nextBytes;
+          foundFunction = true;
+          yield { name: path.join("."), path, fn: variant };
+        } else if (resolver.members(variant).length > 0) {
+          const childFound = yield* bridgeMemberFunctions(
+            variant,
+            path,
+            nextBytes,
+            nested,
+          );
+          foundFunction ||= childFound;
+        }
+      }
+      if (remainingVisits < 0 || remainingBridgeFunctionVisits <= 0) {
+        truncated = true;
+        break;
+      }
     }
+    if (!foundFunction && !truncated) functionlessBridgeObjects.add(value);
+    return foundFunction || truncated;
   }
-  const isolatedBridgeCall = (
+  const directBridgeCall = (
     node: t.CallExpression | t.OptionalCallExpression,
   ):
     | { readonly env: SymbolicEnvironment; readonly callee: SymbolicValue }
     | undefined => {
     const env = resolver.environmentAt(node);
     const callee = resolver.evaluate(node.callee, env);
-    return symbolicVariants(callee).some(
-      (callee) =>
-        callee.kind === "external" &&
-        identity.intactExport(callee.path) &&
-        callee.path.slice(1).join(".") ===
-          "contextBridge.exposeInIsolatedWorld",
-    )
+    return symbolicVariants(callee).some((callee) => {
+      if (callee.kind !== "external" || !identity.intactExport(callee.path))
+        return false;
+      const target = callee.path.slice(1).join(".");
+      return (
+        target === "contextBridge.exposeInMainWorld" ||
+        target === "contextBridge.exposeInIsolatedWorld"
+      );
+    })
       ? { env, callee }
       : undefined;
   };
@@ -1171,12 +1273,9 @@ export function* collectElectronWrappedCallPathsSteps(
       exposure.worldIdIndex === null
         ? undefined
         : argumentNode(node.arguments[exposure.worldIdIndex]);
+    const siteKey = javascriptSourceRangeKey(location);
     // Absent when complete direct syntax leaves substitution nothing to add.
-    const site = bridgeSiteAt(
-      node,
-      javascriptSourceRangeKey(location),
-      worldNode,
-    );
+    const site = bridgeSiteAt(node, siteKey, worldNode);
     // The site evaluated in its own scope is not an invocation; a traced call
     // that leaves this exposure unresolved keeps the syntax observation.
     const unresolved = (): void => {
@@ -1220,43 +1319,99 @@ export function* collectElectronWrappedCallPathsSteps(
       unresolved();
     } else if (site !== undefined) {
       // Each invocation binds its own key and object, so one helper's exposure
-      // call contributes a separate API per key it is invoked with.
-      const inventory = bridgeMemberInventory(object);
-      const finding: ElectronContextBridgeFinding = {
-        world: exposure.world,
-        world_id: worldId,
-        api_key: key.value,
-        api_key_expression: null,
-        api_status: "dynamic",
-        resolution_basis: "wrapper-substitution",
-        members: inventory.members,
-        unknown_members: inventory.unknown,
-        module_key: null,
-        location,
-      };
-      const identity = bridgeExposureKey(finding);
-      const contribution = bridgeContributionKey(finding);
-      const prior = site.exposures.get(identity);
-      if (prior === undefined)
-        site.exposures.set(identity, {
-          value: finding,
-          contributions: new Set([contribution]),
-        });
-      else if (!prior.contributions.has(contribution)) {
-        prior.contributions.add(contribution);
-        const merged = mergeBridgeExposures(
-          prior.value,
-          finding,
-          site.worldExpression,
-        );
-        if (
-          merged.world_id?.status === "dynamic" &&
-          prior.value.world_id?.status === "literal" &&
-          worldId?.status === "literal"
-        )
-          accumulator.unknownFindings += 1;
-        prior.value = merged;
+      // call contributes a separate API per key it is invoked with. When a
+      // direct call already resolved its API shape completely, retain those
+      // API facts and record substitution only when it resolved the key or
+      // isolated world ID.
+      const direct =
+        context.calls.length === 0 ? directBridgeAt(siteKey) : undefined;
+      const directCompleteApi =
+        direct !== undefined && hasCompleteBridgeApi(direct);
+      const resolvedDirectHeader =
+        directCompleteApi &&
+        (direct.api_key === null ||
+          (direct.world_id?.status === "dynamic" &&
+            worldId?.status === "literal"));
+      if (!directCompleteApi || resolvedDirectHeader) {
+        let finding: ElectronContextBridgeFinding;
+        if (directCompleteApi) {
+          finding = {
+            world: exposure.world,
+            world_id: worldId,
+            api_key: key.value,
+            api_key_expression: null,
+            api_status: direct.api_status,
+            resolution_basis: "wrapper-substitution",
+            members: direct.members,
+            unknown_members: direct.unknown_members,
+            ...(direct.resolution_sources !== undefined
+              ? { resolution_sources: direct.resolution_sources }
+              : {}),
+            module_key: null,
+            location,
+          };
+        } else {
+          const inventory = bridgeMemberInventory(object);
+          finding = {
+            world: exposure.world,
+            world_id: worldId,
+            api_key: key.value,
+            api_key_expression: null,
+            api_status: "dynamic",
+            resolution_basis: "wrapper-substitution",
+            members: inventory.members,
+            unknown_members: inventory.unknown,
+            module_key: null,
+            location,
+          };
+        }
+        const identity = bridgeExposureKey(finding);
+        const contribution = bridgeContributionKey(finding);
+        const prior = site.exposures.get(identity);
+        if (prior === undefined)
+          site.exposures.set(identity, {
+            value: finding,
+            contributions: new Set([contribution]),
+          });
+        else if (!prior.contributions.has(contribution)) {
+          prior.contributions.add(contribution);
+          const merged = mergeBridgeExposures(
+            prior.value,
+            finding,
+            site.worldExpression,
+          );
+          if (
+            merged.world_id?.status === "dynamic" &&
+            prior.value.world_id?.status === "literal" &&
+            worldId?.status === "literal"
+          )
+            accumulator.unknownFindings += 1;
+          prior.value = merged;
+        }
       }
+    }
+    for (const variant of symbolicVariants(object)) {
+      if (variant.kind !== "function") continue;
+      const callableContext = metadataContext(keyContext, variant);
+      if (!callableContext) continue;
+      functionBody(
+        variant,
+        runtimeFunctionParameters(variant.node).map(() =>
+          symbolicUnknown("public API argument"),
+        ),
+        {
+          ...callableContext,
+          entryNode: node,
+          calls: [],
+          entryKind: "bridge-member",
+          entry: key.value,
+          entryPath: [key.value],
+          channel: null,
+          steps: [step(node, "exposure", key.value)],
+          active: new Set(),
+        },
+        node,
+      );
     }
     for (const { name, path, fn } of bridgeMemberFunctions(object)) {
       const memberContext = metadataContext(keyContext, fn);
@@ -1458,12 +1613,19 @@ export function* collectElectronWrappedCallPathsSteps(
     node: t.CallExpression | t.OptionalCallExpression,
   ): Generator<void, void> {
     if (remainingVisits < 0) return;
-    const isolatedSeed = t.isStringLiteral(node.arguments[0])
-      ? undefined
-      : isolatedBridgeCall(node);
-    if (!t.isStringLiteral(node.arguments[0]) && isolatedSeed === undefined)
-      return;
-    const env = isolatedSeed?.env ?? resolver.environmentAt(node);
+    const firstArg = argumentNode(node.arguments[0]);
+    const unwrappedFirstArg =
+      firstArg === undefined
+        ? undefined
+        : unwrapJavaScriptExpression(firstArg).node;
+    const hasStringSeed =
+      unwrappedFirstArg !== undefined &&
+      (t.isStringLiteral(unwrappedFirstArg) ||
+        (t.isTemplateLiteral(unwrappedFirstArg) &&
+          unwrappedFirstArg.expressions.length === 0));
+    const bridgeSeed = hasStringSeed ? undefined : directBridgeCall(node);
+    if (!hasStringSeed && bridgeSeed === undefined) return;
+    const env = bridgeSeed?.env ?? resolver.environmentAt(node);
     let context: PathContext = {
       entryNode: node,
       calls: [],
@@ -1527,7 +1689,7 @@ export function* collectElectronWrappedCallPathsSteps(
         }
       }
     }
-    call(node, env, context, isolatedSeed?.callee);
+    call(node, env, context, bridgeSeed?.callee);
   }
   // The shared walker supplies one bounded batch at a time. Prefix work must
   // run outside its synchronous callback so cancellation can interrupt a large

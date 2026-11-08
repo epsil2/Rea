@@ -5,6 +5,7 @@ import type { ElectronStaticValue } from "./electronStaticAnalysisTypes.js";
 import {
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { electronMemberPath } from "./javascriptElectronMemberWrites.js";
 import { sourceSlice } from "./javascriptStaticAnalysisHelpers.js";
@@ -78,11 +79,46 @@ export function handlerKind(
  */
 export const contextBridgeMemberPathDepth = 8;
 
-/** Collect statically visible dotted keys from one literal contextBridge API object. */
+/**
+ * Per-file work and representation budget for contextBridge member enumeration.
+ * Bounds shared sub-object DAG expansion before path strings are allocated and
+ * records truncated branches as explicit unknown members.
+ */
+export const contextBridgeMemberVisitLimit = 4_096;
+export const contextBridgeMemberByteLimit = 131_072;
+
+export interface ContextBridgeMemberBudget {
+  remainingVisits: number;
+  remainingBytes: number;
+}
+
+export const createContextBridgeMemberBudget =
+  (): ContextBridgeMemberBudget => ({
+    remainingVisits: contextBridgeMemberVisitLimit,
+    remainingBytes: contextBridgeMemberByteLimit,
+  });
+
+export type ContextBridgeNestedPropertyResolution =
+  | {
+      readonly kind: "object";
+      readonly object: t.ObjectExpression;
+      readonly activeNodes: ReadonlySet<t.Node>;
+    }
+  | { readonly kind: "leaf" }
+  | { readonly kind: "unknown" };
+
+export type ContextBridgeNestedPropertyResolver = (
+  value: t.Node,
+  activeNodes: ReadonlySet<t.Node>,
+) => ContextBridgeNestedPropertyResolution;
+
+/** Collect statically visible dotted keys or direct callable shape from one contextBridge API argument. */
 export const collectContextBridgeMembers = (
   node: t.Node | null | undefined,
+  resolveNestedProperty?: ContextBridgeNestedPropertyResolver,
+  budget: ContextBridgeMemberBudget = createContextBridgeMemberBudget(),
 ): {
-  readonly status: "object-literal" | "dynamic" | "missing";
+  readonly status: "object-literal" | "function" | "dynamic" | "missing";
   readonly members: readonly string[];
   readonly unknown: number;
 } => {
@@ -92,7 +128,18 @@ export const collectContextBridgeMembers = (
       members: [],
       unknown: 0,
     };
-  if (!t.isObjectExpression(node))
+  const unwrapped = unwrapJavaScriptExpression(node).node;
+  if (
+    t.isArrowFunctionExpression(unwrapped) ||
+    t.isFunctionExpression(unwrapped) ||
+    t.isFunctionDeclaration(unwrapped)
+  )
+    return {
+      status: "function",
+      members: [],
+      unknown: 0,
+    };
+  if (!t.isObjectExpression(unwrapped))
     return {
       status: "dynamic",
       members: [],
@@ -102,10 +149,19 @@ export const collectContextBridgeMembers = (
     members: [],
     unknown: 0,
   };
-  collectMembersAt(node, [], state);
+  collectMembersAt(
+    unwrapped,
+    "",
+    0,
+    0,
+    state,
+    new Set([unwrapped]),
+    budget,
+    resolveNestedProperty,
+  );
   const members = [...new Set(state.members)].sort(compareUnicodeCodePoints);
   return {
-    status: "object-literal",
+    status: state.unknown === 0 ? "object-literal" : "dynamic",
     members,
     unknown: state.unknown,
   };
@@ -113,14 +169,26 @@ export const collectContextBridgeMembers = (
 
 const collectMembersAt = (
   object: t.ObjectExpression,
-  prefix: readonly string[],
+  prefixPath: string,
+  prefixDepth: number,
+  prefixBytes: number,
   state: { members: string[]; unknown: number },
+  activeNodes: ReadonlySet<t.Node>,
+  budget: ContextBridgeMemberBudget,
+  resolveNestedProperty?: ContextBridgeNestedPropertyResolver,
 ): void => {
-  if (prefix.length >= contextBridgeMemberPathDepth) {
+  if (prefixDepth >= contextBridgeMemberPathDepth) {
     state.unknown += 1;
     return;
   }
-  for (const property of object.properties) {
+  for (let index = 0; index < object.properties.length; index += 1) {
+    if (budget.remainingVisits <= 0) {
+      state.unknown += object.properties.length - index;
+      return;
+    }
+    budget.remainingVisits -= 1;
+    const property = object.properties[index];
+    if (property === undefined) break;
     if (t.isSpreadElement(property)) {
       state.unknown += 1;
       continue;
@@ -137,11 +205,48 @@ const collectMembersAt = (
       name === "__proto__"
     )
       continue;
-    const segments = [...prefix, name];
-    const path = segments.join(".");
+    const nameBytes = Buffer.byteLength(name, "utf8");
+    const pathBytes =
+      prefixDepth === 0 ? nameBytes : prefixBytes + 1 + nameBytes;
+    if (pathBytes > budget.remainingBytes) {
+      budget.remainingVisits = 0;
+      state.unknown += object.properties.length - index;
+      return;
+    }
+    budget.remainingBytes -= pathBytes;
+    const path = prefixDepth === 0 ? name : `${prefixPath}.${name}`;
     state.members.push(path);
-    if (t.isObjectProperty(property) && t.isObjectExpression(property.value))
-      collectMembersAt(property.value, segments, state);
+    if (!t.isObjectProperty(property)) continue;
+    if (resolveNestedProperty !== undefined) {
+      const nested = resolveNestedProperty(property.value, activeNodes);
+      if (nested.kind === "object")
+        collectMembersAt(
+          nested.object,
+          path,
+          prefixDepth + 1,
+          pathBytes,
+          state,
+          nested.activeNodes,
+          budget,
+          resolveNestedProperty,
+        );
+      else if (nested.kind === "unknown") state.unknown += 1;
+      continue;
+    }
+    const nestedValue = unwrapJavaScriptExpression(property.value).node;
+    if (t.isObjectExpression(nestedValue) && !activeNodes.has(nestedValue)) {
+      const nextActive = new Set(activeNodes);
+      nextActive.add(nestedValue);
+      collectMembersAt(
+        nestedValue,
+        path,
+        prefixDepth + 1,
+        pathBytes,
+        state,
+        nextActive,
+        budget,
+      );
+    }
   }
 };
 
